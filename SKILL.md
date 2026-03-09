@@ -346,39 +346,43 @@ For LEVEL3, the AEXX fitting must complete **before** Bulk/relax starts, since B
 
 **CRITICAL: For any calculations on small cells (primitive cells, AEXX fitting, etc.), convergence testing is MANDATORY.** Only supercell calculations (60+ atoms) can safely use Gamma-only without testing.
 
-#### K-spacing Formula (Auto Mode)
+#### N×a ≈ R Method (Auto Mode)
 
-The k-mesh is determined by maintaining consistent k-point density via k-spacing:
+k-mesh density is determined by the parameter R (in Å): for each lattice direction, `N_i = max(1, round(R / a_i))`, where `a_i` is the lattice constant along that direction. Larger R = denser mesh.
 
-```
-N_i = max(1, ceil(b_i / k_spacing))
-```
+**Recommended R values:**
 
-where `b_i = 2π / a_i` is the reciprocal lattice vector length along axis i.
-
-**Recommended k-spacing values:**
-
-| Functional | k_spacing (Å⁻¹) | Use Case |
+| Accuracy | R (Å) | Use Case |
 |---|---|---|
-| PBE (standard) | 0.03–0.04 | Primitive cell PBE calculations |
-| HSE (production) | 0.04–0.05 | AEXX fitting, HSE statics on primitive cell |
-| Coarse | 0.06–0.08 | Quick convergence test starting point |
+| Coarse | 15–20 | Quick convergence test starting point |
+| Standard (PBE) | 30–40 | Production PBE on primitive cells |
+| HSE | 20–30 | AEXX fitting, HSE statics on primitive cells |
+| Very dense | 40–50 | Convergence verification, DOS |
+
+**Example (Al₂O₃, a=4.76 Å, c=12.99 Å):**
+
+| R | k-mesh | Note |
+|---|---|---|
+| 15 | 3×3×1 | Too coarse |
+| 20 | 4×4×2 | Minimum for HSE |
+| 25 | 5×5×2 | Good for HSE |
+| 30 | 6×6×2 | Standard PBE |
+| 40 | 8×8×3 | Well-converged |
 
 **Python helper function:**
 ```python
 import numpy as np
 
-def get_kmesh(lattice_vectors, k_spacing=0.04):
-    """Determine k-mesh from lattice vectors and target k-spacing.
+def get_kmesh(lattice_vectors, R=30):
+    """Determine k-mesh from lattice vectors and target R parameter.
     lattice_vectors: 3x3 array (rows are vectors, in Å)
-    k_spacing: target spacing in Å⁻¹ (smaller = denser)
+    R: target N*a product in Å (larger = denser)
     Returns: [N1, N2, N3]
     """
-    recip = 2 * np.pi * np.linalg.inv(lattice_vectors).T
     kmesh = []
     for i in range(3):
-        b_len = np.linalg.norm(recip[i])
-        n = max(1, int(np.ceil(b_len / k_spacing)))
+        a_len = np.linalg.norm(lattice_vectors[i])
+        n = max(1, round(R / a_len))
         kmesh.append(n)
     return kmesh
 ```
@@ -406,22 +410,21 @@ Rationale: Reciprocal vectors are very short (e.g., `2π/13 ≈ 0.48 Å⁻¹`), 
 1. **Prepare test calculations** in `Bulk/ktest/` with increasing k-mesh density:
 ```
 Bulk/ktest/
-├── k1/    # e.g., 2×2×2 (coarse)
+├── k1/    # e.g., 3×3×1 (coarse, R≈15)
 │   ├── POSCAR INCAR KPOINTS POTCAR submit_job
-├── k2/    # e.g., 4×4×2 (medium)
+├── k2/    # e.g., 4×4×2 (medium, R≈20)
 │   ├── ...
-├── k3/    # e.g., 6×6×3 (dense)
+├── k3/    # e.g., 6×6×2 (dense, R≈30)
 │   ├── ...
-├── k4/    # e.g., 8×8×4 (very dense, optional)
+├── k4/    # e.g., 8×8×3 (very dense, R≈40, optional)
 │   ├── ...
 └── ktest_result.log
 ```
 
 2. **Choose test k-meshes** based on the lattice symmetry and cell dimensions:
-   - Start from auto-determined k-mesh at k_spacing=0.06
-   - Increase density by ~1.5× each step
+   - Start from R≈15 (coarse), increase to R≈20, 30, 40
    - Ensure meshes respect lattice symmetry (e.g., hexagonal: N1=N2≠N3)
-   - For HSE: fewer points needed (HSE converges faster with k-mesh), use k_spacing 0.04–0.06
+   - For HSE: fewer points needed (HSE converges faster with k-mesh), R≈20–30 usually sufficient
 
 3. **Run PBE static** at each k-mesh (fast, even if final target is HSE). Compare total energy.
 
