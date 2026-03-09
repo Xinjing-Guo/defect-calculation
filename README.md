@@ -38,8 +38,11 @@ For LEVEL2/3, the skill handles HSE-specific parameters (ALGO=Damped/All, LREAL=
 
 ### 5. Full Automation
 
-- **SLURM job automation** — `auto_monitor.sh` runs in background, checks convergence every 10 minutes, automatically prepares next-phase input files and submits jobs
+- **SLURM job automation** — background monitoring scripts check convergence periodically, automatically prepare next-phase input files and submit jobs
+  - `auto_monitor.sh` — LEVEL1 (PBE+PBE), 4-phase loop, checks every 10 minutes
+  - `auto_level2.sh` — LEVEL2 (PBE+HSE), 5-phase sequential (ktest → AEXX fitting → HSE statics → charge state analysis → formation energy)
 - **Phase-aware workflow** — enforces strict dependencies: bulk relax → defect structures → neutral relax → charge state analysis → charged relax → statics → corrections → formation energy
+- **LEVEL2 extras** — k-mesh convergence test on primitive cell, AEXX fitting to experimental band gap, HSE statics in separate `statics_hse/` directories (preserving LEVEL1 results), charge state analysis from HSE EIGENVAL
 - **Operation logging** — every step is timestamped and logged to `defect_workflow.log` with full details (structure source, EIGENVAL analysis, NELECT values, energies, corrections)
 - **Optional AI review** (`--claude` flag) — Claude reviews each converged calculation for anomalies (energy oscillation, unconverged SCF, abnormal forces, structure collapse) before advancing
 
@@ -71,8 +74,10 @@ ProjectRoot/
 │   │       ├── q+1/relax/, q+1/statics/
 │   │       └── ...
 │   └── Impurity/          # Substitutional impurities
-├── FormationEnergy/       # Output: plots (.pdf/.png) and logs
-├── auto_monitor.sh        # SLURM job automation
+├── FormationEnergy/       # LEVEL1 output: plots (.pdf/.png) and logs
+├── FormationEnergy_L2/    # LEVEL2 output (HSE results)
+├── auto_monitor.sh        # LEVEL1 SLURM job automation
+├── auto_level2.sh         # LEVEL2 full automation (ktest→AEXX→HSE→formation energy)
 ├── formation_energy.py    # Formation energy calculation & plotting
 ├── fnv_correction.py      # FNV correction for charged defects
 ├── prepare_defect.py      # Defect structure builder

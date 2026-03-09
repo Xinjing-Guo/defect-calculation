@@ -1593,7 +1593,32 @@ vasp_std = /opt/vasp.5.4.4/bin/vasp_std
 
 ### 自动监控与调度系统
 
-**核心思路：** 后台监控脚本 `auto_monitor.sh` 每10分钟检查一次任务状态，收敛后自动准备下一阶段输入文件并提交。全程无需人工干预。
+**核心思路：** 后台监控脚本自动检查任务状态，收敛后自动准备下一阶段输入文件并提交，直至形成能图绘制完毕。全程无需人工干预。
+
+**两种自动化模式：**
+
+| 模式 | 适用场景 | 脚本 | 特点 |
+|------|---------|------|------|
+| LEVEL1 | PBE relax + PBE statics | `auto_monitor.sh` | 循环轮询，4个phase |
+| LEVEL2 | PBE relax + HSE statics | `auto_level2.sh` | 顺序执行，5个phase（含ktest+AEXX） |
+| LEVEL3 | HSE relax + HSE statics | 需根据LEVEL2脚本修改 | relax阶段也用HSE参数 |
+
+**后台启动与监控：**
+
+用户要求"后台监测任务，等任务结束自行完成下一步分析，直至形成能图绘制完毕"时，Claude应：
+1. 根据计算Level生成对应的自动化脚本
+2. 在后台启动脚本：`nohup bash auto_level2.sh > level2_monitor.out 2>&1 &`
+3. 保存PID：`echo $! > level2_monitor.pid`
+4. 告知用户如何查看进度：`tail -f level2_monitor.out`
+
+**脚本权限原则：**
+- 不删除任何文件
+- 修改配置文件前必须备份（如 `formation_config.yaml` → `formation_config.yaml.level1_bak`）
+- 其余操作（创建目录、写文件、提交任务）均可自主执行
+
+---
+
+#### LEVEL1 自动化
 
 **需要的文件：**
 1. `defect_config.txt` — 定义缺陷类型、操作方式、电荷态
@@ -2479,6 +2504,750 @@ for d in "$WORKDIR"/Defect/Intrinsic/* "$WORKDIR"/Defect/Impurity/*; do
         check_dir "$q/statics" "$(basename $d)/$(basename $q)/statics"
     done
 done
+```
+
+---
+
+#### LEVEL2 自动化
+
+**LEVEL2 工作流（PBE relax + HSE statics）比 LEVEL1 多出 k-mesh 收敛测试和 AEXX 拟合两个前置步骤，且 statics 使用 HSE 泛函。**
+
+**LEVEL2 Phase 依赖关系：**
+```
+Phase 1: K-mesh 收敛测试（原胞 PBE static，多个 k-mesh）
+    ↓ 确定收敛 k-mesh
+Phase 2: AEXX 拟合（原胞 HSE static，3个AEXX值）
+    ↓ 线性拟合得到最优 AEXX
+Phase 3: HSE statics (Bulk + q0) → 电荷态分析
+    ↓ 从 HSE EIGENVAL 分析缺陷能级
+Phase 4: HSE statics (charged defects)
+    ↓
+Phase 5: FNV 修正 + 形成能计算 + 绘图
+```
+
+**关键差异（vs LEVEL1）：**
+- Statics 使用 `statics_hse/` 目录，不覆盖已有的 PBE `statics/`
+- 电荷态分析使用 **HSE EIGENVAL**（`statics_hse/EIGENVAL`），不是 PBE relax 后的
+- `formation_config.yaml` 使用 HSE 带隙，`bulk_static` 指向 `Bulk/statics_hse`
+- AEXX 值通过拟合实验带隙确定，不是默认的 0.25
+
+#### 4. auto_level2.sh — LEVEL2 全自动监控脚本
+
+```bash
+#!/bin/bash
+# auto_level2.sh — LEVEL2 全自动工作流 (PBE relax + HSE statics)
+# 从 ktest 收敛测试 → AEXX 拟合 → HSE statics → 电荷态分析 → 形成能图
+#
+# 使用: nohup bash auto_level2.sh > level2_monitor.out 2>&1 &
+#       echo $! > level2_monitor.pid
+#
+# 停止: kill $(cat level2_monitor.pid)
+
+set -euo pipefail
+
+WORKDIR=$(pwd)
+LOG="$WORKDIR/defect_workflow.log"
+INTERVAL=300  # 5分钟检查一次
+
+# ===== 以下参数需根据实际项目修改 =====
+ENCUT=520                              # POTCAR ENMAX × 1.3
+VASP_STD="/opt/vasp.5.4.4/bin/vasp_std"
+VASP_GAM="/opt/vasp.5.4.4/bin/vasp_gam"
+NODE_NUMBER=2
+CORE_PER_NODE=52
+TOTAL_CORES=$((NODE_NUMBER * CORE_PER_NODE))
+QUEUE="compute2"
+EXP_GAP=8.8                           # 实验带隙 (eV)
+
+# 原胞信息
+PRIM_POSCAR="$WORKDIR/Bulk/ktest/primitive_POSCAR"
+# ===== 参数修改结束 =====
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
+    echo "[$(date '+%H:%M:%S')] $1"
+}
+
+is_converged() {
+    local dir="$1"
+    [ -f "$dir/OUTCAR" ] && grep -q "reached required accuracy" "$dir/OUTCAR" 2>/dev/null
+}
+
+get_energy() {
+    grep "energy  without entropy" "$1/OUTCAR" 2>/dev/null | tail -1 | awk '{print $NF}'
+}
+
+get_nelect() {
+    grep "NELECT" "$1/OUTCAR" 2>/dev/null | head -1 | awk '{print $3}' | cut -d. -f1
+}
+
+wait_for_jobs() {
+    local label="$1"
+    shift
+    local dirs=("$@")
+    log_msg "WAITING: $label (${#dirs[@]} jobs)..."
+    while true; do
+        local all_done=true
+        for d in "${dirs[@]}"; do
+            if ! is_converged "$d"; then
+                all_done=false
+                break
+            fi
+        done
+        if $all_done; then
+            log_msg "CONVERGED: $label — all done"
+            return 0
+        fi
+        sleep $INTERVAL
+    done
+}
+
+submit_dir() {
+    local dir="$1"
+    local label="$2"
+    cd "$dir"
+    local jobid=$(sbatch --parsable submit_job 2>/dev/null)
+    log_msg "SUBMITTED: $label → Job $jobid"
+    cd "$WORKDIR"
+}
+
+write_submit_std() {
+    local dir="$1"
+    local name="$2"
+    local nodes="${3:-$NODE_NUMBER}"
+    local cores=$((nodes * CORE_PER_NODE))
+    cat > "$dir/submit_job" << SUBMIT_EOF
+#!/bin/sh
+#SBATCH -N $nodes
+#SBATCH -J $name
+#SBATCH -n $cores
+#SBATCH --ntasks-per-node=$CORE_PER_NODE
+#SBATCH --partition=$QUEUE
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
+#SBATCH --time=48:00:00
+
+mpirun -n $cores $VASP_STD > vasp.out 2>&1
+SUBMIT_EOF
+    chmod +x "$dir/submit_job"
+}
+
+write_submit_gam() {
+    local dir="$1"
+    local name="$2"
+    cat > "$dir/submit_job" << SUBMIT_EOF
+#!/bin/sh
+#SBATCH -N $NODE_NUMBER
+#SBATCH -J $name
+#SBATCH -n $TOTAL_CORES
+#SBATCH --ntasks-per-node=$CORE_PER_NODE
+#SBATCH --partition=$QUEUE
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
+#SBATCH --time=48:00:00
+
+mpirun -n $TOTAL_CORES $VASP_GAM > vasp.out 2>&1
+SUBMIT_EOF
+    chmod +x "$dir/submit_job"
+}
+
+# ============================================================
+# PHASE 1: K-mesh 收敛测试
+# ============================================================
+phase1_ktest() {
+    log_msg "===== PHASE 1: K-mesh Convergence Test ====="
+
+    # 前提: Bulk/ktest/k1 ~ k4 目录已准备并提交
+    # 如果 ktest 目录不存在，需要先准备
+    if [ ! -d "$WORKDIR/Bulk/ktest/k1" ]; then
+        log_msg "Preparing ktest directories..."
+        # 使用 N×a ≈ R method 计算候选 k-mesh
+        # k1~k4 按递增密度，需要知道原胞晶格参数
+        # 这里假设 ktest 已由 Claude 在交互阶段准备好
+        log_msg "ERROR: ktest directories not found. Prepare them first."
+        exit 1
+    fi
+
+    local dirs=()
+    for k in k1 k2 k3 k4; do
+        [ -d "$WORKDIR/Bulk/ktest/$k" ] && dirs+=("$WORKDIR/Bulk/ktest/$k")
+    done
+
+    wait_for_jobs "ktest" "${dirs[@]}"
+
+    # 分析收敛性
+    log_msg "Analyzing ktest convergence..."
+    local natoms=$(python3 -c "
+with open('$PRIM_POSCAR') as f:
+    lines = f.readlines()
+    print(sum(int(x) for x in lines[6].split()))
+")
+    local prev_e=""
+    local converged_kmesh=""
+    local converged_dir=""
+
+    for k in k1 k2 k3 k4; do
+        local d="$WORKDIR/Bulk/ktest/$k"
+        [ -d "$d" ] || continue
+        local E=$(get_energy "$d")
+        local kpts=$(head -4 "$d/KPOINTS" | tail -1)
+        if [ -n "$prev_e" ]; then
+            local delta=$(python3 -c "print(f'{abs(($E - $prev_e) / $natoms * 1000):.2f}')")
+            log_msg "  $k ($kpts): E=$E eV, delta=${delta} meV/atom"
+            local is_conv=$(python3 -c "print('yes' if abs(($E - $prev_e) / $natoms * 1000) < 1.0 else 'no')")
+            if [ "$is_conv" = "yes" ] && [ -z "$converged_kmesh" ]; then
+                converged_kmesh="$kpts"
+                converged_dir="$k"
+                log_msg "  -> CONVERGED at $k ($kpts), delta=${delta} meV/atom < 1 meV/atom"
+            fi
+        else
+            log_msg "  $k ($kpts): E=$E eV (reference)"
+        fi
+        prev_e="$E"
+    done
+
+    if [ -z "$converged_kmesh" ]; then
+        converged_kmesh=$(head -4 "$WORKDIR/Bulk/ktest/k4/KPOINTS" | tail -1)
+        converged_dir="k4"
+        log_msg "  WARNING: Not fully converged, using densest mesh k4: $converged_kmesh"
+    fi
+
+    echo "$converged_kmesh" > "$WORKDIR/Bulk/ktest/converged_kmesh.txt"
+    echo "$converged_dir" > "$WORKDIR/Bulk/ktest/converged_dir.txt"
+    log_msg "K-mesh selected: $converged_kmesh (from $converged_dir)"
+}
+
+# ============================================================
+# PHASE 2: AEXX 拟合
+# ============================================================
+phase2_aexx() {
+    log_msg "===== PHASE 2: AEXX Fitting ====="
+
+    local kmesh=$(cat "$WORKDIR/Bulk/ktest/converged_kmesh.txt")
+    local ka=$(echo $kmesh | awk '{print $1}')
+    local kb=$(echo $kmesh | awk '{print $2}')
+    local kc=$(echo $kmesh | awk '{print $3}')
+
+    for aexx_val in 0.20 0.25 0.30; do
+        local aexx_dir="$WORKDIR/Bulk/AEXX/aexx_${aexx_val}"
+        mkdir -p "$aexx_dir"
+
+        cp "$PRIM_POSCAR" "$aexx_dir/POSCAR"
+        cp "$WORKDIR/Bulk/relax/POTCAR" "$aexx_dir/POTCAR"
+
+        cat > "$aexx_dir/INCAR" << INCAR_EOF
+SYSTEM = AEXX fitting - AEXX=${aexx_val}
+ENCUT  = $ENCUT
+EDIFF  = 1E-6
+PREC   = Accurate
+NELM   = 200
+LREAL  = .FALSE.
+ISMEAR = 0
+SIGMA  = 0.05
+GGA    = PE
+LHFCALC  = .TRUE.
+HFSCREEN = 0.2
+AEXX     = $aexx_val
+ALGO     = All
+TIME     = 0.4
+PRECFOCK = Fast
+ISPIN  = 2
+LORBIT = 10
+LWAVE  = .FALSE.
+LCHARG = .FALSE.
+NPAR   = 4
+INCAR_EOF
+
+        cat > "$aexx_dir/KPOINTS" << KPOINTS_EOF
+Gamma-centered ${ka}x${kb}x${kc}
+0
+G
+$ka $kb $kc
+0 0 0
+KPOINTS_EOF
+
+        write_submit_std "$aexx_dir" "aexx_${aexx_val}" 2
+        submit_dir "$aexx_dir" "AEXX/${aexx_val}"
+    done
+
+    local aexx_dirs=()
+    for aexx_val in 0.20 0.25 0.30; do
+        aexx_dirs+=("$WORKDIR/Bulk/AEXX/aexx_${aexx_val}")
+    done
+    wait_for_jobs "AEXX fitting" "${aexx_dirs[@]}"
+
+    # Python 拟合 AEXX
+    log_msg "Fitting AEXX to experimental gap ${EXP_GAP} eV..."
+
+    python3 << PYEOF
+import numpy as np
+import os
+
+aexx_dir = "$WORKDIR/Bulk/AEXX"
+exp_gap = $EXP_GAP
+
+def get_band_gap(eigenval_path):
+    with open(eigenval_path) as f:
+        lines = f.readlines()
+    header = lines[5].split()
+    nkpts = int(header[1])
+    nbands = int(header[2])
+    vbm, cbm = -999.0, 999.0
+    idx = 7
+    for k in range(nkpts):
+        idx += 1  # blank line
+        idx += 1  # k-point header
+        for b in range(nbands):
+            parts = lines[idx].split()
+            e_up = float(parts[1])
+            occ_up = float(parts[2])
+            if len(parts) > 3:
+                e_dn = float(parts[3])
+                occ_dn = float(parts[4])
+                if occ_up > 0.5: vbm = max(vbm, e_up)
+                else: cbm = min(cbm, e_up)
+                if occ_dn > 0.5: vbm = max(vbm, e_dn)
+                else: cbm = min(cbm, e_dn)
+            else:
+                if occ_up > 0.5: vbm = max(vbm, e_up)
+                else: cbm = min(cbm, e_up)
+            idx += 1
+    return cbm - vbm, vbm, cbm
+
+aexx_vals, gaps = [], []
+for d in sorted(os.listdir(aexx_dir)):
+    if d.startswith("aexx_"):
+        aexx = float(d.replace("aexx_", ""))
+        ev = os.path.join(aexx_dir, d, "EIGENVAL")
+        if os.path.exists(ev):
+            gap, vbm, cbm = get_band_gap(ev)
+            aexx_vals.append(aexx)
+            gaps.append(gap)
+            print(f"  AEXX={aexx:.2f}: gap={gap:.4f} eV (VBM={vbm:.4f}, CBM={cbm:.4f})")
+
+coeffs = np.polyfit(aexx_vals, gaps, 1)
+a, b = coeffs
+aexx_fit = (exp_gap - b) / a
+aexx_round = round(aexx_fit, 2)
+gap_at_round = np.polyval(coeffs, aexx_round)
+
+result = f"""AEXX Fitting Result:
+  Experimental gap: {exp_gap:.2f} eV
+  Linear fit: gap = {a:.4f} * AEXX + {b:.4f}
+  Fitted AEXX = {aexx_fit:.4f}
+  Rounded AEXX = {aexx_round:.2f}
+  Expected gap at AEXX={aexx_round:.2f}: {gap_at_round:.4f} eV"""
+print(result)
+
+with open(os.path.join(aexx_dir, "aexx_fit.log"), "w") as f:
+    f.write(result + "\n")
+
+with open(os.path.join(aexx_dir, "fitted_aexx.txt"), "w") as f:
+    f.write(f"{aexx_round:.2f}\n")
+PYEOF
+
+    local fitted=$(cat "$WORKDIR/Bulk/AEXX/fitted_aexx.txt")
+    log_msg "AEXX fitting complete: AEXX=$fitted"
+}
+
+# ============================================================
+# PHASE 3: HSE Statics (Bulk + q0) + 电荷态分析
+# ============================================================
+phase3_hse_preliminary() {
+    log_msg "===== PHASE 3: HSE Statics (Bulk + q0) + Charge State Analysis ====="
+
+    local AEXX=$(cat "$WORKDIR/Bulk/AEXX/fitted_aexx.txt")
+    log_msg "Using AEXX=$AEXX"
+
+    write_hse_static_incar() {
+        local dir="$1"
+        local nelect_line=""
+        [ -n "${2:-}" ] && nelect_line="NELECT = $2"
+        cat > "$dir/INCAR" << INCAR_EOF
+SYSTEM = HSE static - AEXX=${AEXX}
+ENCUT  = $ENCUT
+EDIFF  = 1E-5
+PREC   = Accurate
+NELM   = 200
+LREAL  = .FALSE.
+ISMEAR = 0
+SIGMA  = 0.05
+GGA    = PE
+LHFCALC  = .TRUE.
+HFSCREEN = 0.2
+AEXX     = $AEXX
+ALGO     = All
+TIME     = 0.4
+PRECFOCK = Fast
+ISPIN  = 2
+LORBIT = 10
+LWAVE  = .FALSE.
+LCHARG = .TRUE.
+ICORELEVEL = 1
+LVHAR  = .TRUE.
+ICHARG = 1
+NPAR   = 8
+$nelect_line
+INCAR_EOF
+    }
+
+    write_gamma_kpoints() {
+        cat > "$1/KPOINTS" << 'KPT'
+Gamma
+0
+G
+1 1 1
+0 0 0
+KPT
+    }
+
+    # --- Bulk HSE statics ---
+    local bulk_hse="$WORKDIR/Bulk/statics_hse"
+    mkdir -p "$bulk_hse"
+    cp "$WORKDIR/Bulk/relax/CONTCAR" "$bulk_hse/POSCAR"
+    cp "$WORKDIR/Bulk/relax/CHGCAR" "$bulk_hse/CHGCAR"
+    cp "$WORKDIR/Bulk/relax/POTCAR" "$bulk_hse/POTCAR"
+    write_gamma_kpoints "$bulk_hse"
+    write_hse_static_incar "$bulk_hse"
+    write_submit_gam "$bulk_hse" "bulk_hse_static"
+    submit_dir "$bulk_hse" "Bulk/statics_hse"
+
+    # --- q0 HSE statics (为每个缺陷) ---
+    # 从 defect_config.txt 读取缺陷列表，或直接遍历已有的 q0/relax 目录
+    local q0_hse_dirs=()
+    for q0_relax in "$WORKDIR"/Defect/Intrinsic/*/q0/relax "$WORKDIR"/Defect/Impurity/*/q0/relax; do
+        [ -d "$q0_relax" ] || continue
+        is_converged "$q0_relax" || continue
+        local defect_name=$(basename $(dirname $(dirname "$q0_relax")))
+        local q0_hse="$(dirname $q0_relax)/../q0/statics_hse"
+        q0_hse=$(cd "$(dirname $q0_relax)/.."; echo "$(pwd)/q0/statics_hse")
+        mkdir -p "$q0_hse"
+        cp "$q0_relax/CONTCAR" "$q0_hse/POSCAR"
+        cp "$q0_relax/CHGCAR" "$q0_hse/CHGCAR"
+        cp "$q0_relax/POTCAR" "$q0_hse/POTCAR"
+        write_gamma_kpoints "$q0_hse"
+        write_hse_static_incar "$q0_hse"
+        write_submit_gam "$q0_hse" "${defect_name}_q0_hse"
+        submit_dir "$q0_hse" "$defect_name/q0/statics_hse"
+        q0_hse_dirs+=("$q0_hse")
+    done
+
+    # 等待 Bulk + 所有 q0 HSE statics
+    wait_for_jobs "HSE statics (Bulk+q0)" "$bulk_hse" "${q0_hse_dirs[@]}"
+
+    # --- 电荷态分析（使用 HSE EIGENVAL） ---
+    log_msg "Analyzing charge states from HSE EIGENVAL..."
+    # 此处调用 Python 分析脚本，对比 Bulk/statics_hse/EIGENVAL 和各缺陷 q0/statics_hse/EIGENVAL
+    # 输出: 各缺陷的电荷态列表和 NELECT 值
+    # 分析逻辑见 Step 5 的三判据法
+
+    python3 << 'PYEOF'
+import os, sys
+
+def read_eigenval(path):
+    """读取 EIGENVAL，返回 (nelect, nbands, bands_list)"""
+    with open(path) as f:
+        lines = f.readlines()
+    header = lines[5].split()
+    nelect = int(float(header[0]))
+    nkpts = int(header[1])
+    nbands = int(header[2])
+    bands = []
+    idx = 7
+    for k in range(nkpts):
+        idx += 1  # blank line
+        idx += 1  # k-point header
+        for b in range(nbands):
+            parts = lines[idx].split()
+            band_idx = int(parts[0])
+            e_up = float(parts[1])
+            if len(parts) > 3:
+                occ_up = float(parts[2])
+                e_dn = float(parts[3])
+                occ_dn = float(parts[4])
+            else:
+                occ_up = float(parts[2])
+                e_dn = e_up
+                occ_dn = occ_up
+            bands.append((band_idx, e_up, occ_up, e_dn, occ_dn))
+            idx += 1
+    return nelect, nbands, bands
+
+workdir = os.environ.get("WORKDIR", os.getcwd())
+bulk_ev = os.path.join(workdir, "Bulk/statics_hse/EIGENVAL")
+b_nelect, b_nbands, b_bands = read_eigenval(bulk_ev)
+
+# Bulk band edges
+vbm, cbm = -999, 999
+for bi, eu, ou, ed, od in b_bands:
+    if ou > 0.5: vbm = max(vbm, eu)
+    else: cbm = min(cbm, eu)
+    if od > 0.5: vbm = max(vbm, ed)
+    else: cbm = min(cbm, ed)
+gap = cbm - vbm
+print(f"Bulk HSE: VBM={vbm:.4f}, CBM={cbm:.4f}, gap={gap:.4f} eV, NELECT={b_nelect}")
+
+# Save HSE band gap
+with open(os.path.join(workdir, "Bulk/AEXX/hse_band_gap.txt"), "w") as f:
+    f.write(f"{gap:.4f}\n")
+
+# Analyze each defect
+for category in ["Intrinsic", "Impurity"]:
+    cat_dir = os.path.join(workdir, "Defect", category)
+    if not os.path.isdir(cat_dir):
+        continue
+    for defect_name in sorted(os.listdir(cat_dir)):
+        ev_path = os.path.join(cat_dir, defect_name, "q0/statics_hse/EIGENVAL")
+        if not os.path.exists(ev_path):
+            continue
+        d_nelect, d_nbands, d_bands = read_eigenval(ev_path)
+        print(f"\n--- {defect_name} (NELECT={d_nelect}) ---")
+        print("Bands near gap:")
+        for bi, eu, ou, ed, od in d_bands:
+            if (vbm - 1.0) < eu < (cbm + 1.0) or (vbm - 1.0) < ed < (cbm + 1.0):
+                flags = []
+                if 0 < ou < 1 or 0 < od < 1: flags.append("PARTIAL_OCC")
+                if vbm < eu < cbm or vbm < ed < cbm: flags.append("IN_GAP")
+                flag_str = " <<< " + ", ".join(flags) if flags else ""
+                print(f"  Band {bi}: E_up={eu:.4f} occ={ou:.3f}  E_dn={ed:.4f} occ={od:.3f}{flag_str}")
+PYEOF
+
+    log_msg "HSE band gap saved to Bulk/AEXX/hse_band_gap.txt"
+    log_msg "Charge state analysis complete (review output above)"
+}
+
+# ============================================================
+# PHASE 4: HSE Statics for charged defects
+# ============================================================
+phase4_hse_charged() {
+    log_msg "===== PHASE 4: HSE Statics (Charged Defects) ====="
+
+    local AEXX=$(cat "$WORKDIR/Bulk/AEXX/fitted_aexx.txt")
+    local CONFIG="$WORKDIR/defect_config.txt"
+
+    write_hse_static_incar() {
+        local dir="$1"
+        local nelect_line=""
+        [ -n "${2:-}" ] && nelect_line="NELECT = $2"
+        cat > "$dir/INCAR" << INCAR_EOF
+SYSTEM = HSE static - AEXX=${AEXX}
+ENCUT  = $ENCUT
+EDIFF  = 1E-5
+PREC   = Accurate
+NELM   = 200
+LREAL  = .FALSE.
+ISMEAR = 0
+SIGMA  = 0.05
+GGA    = PE
+LHFCALC  = .TRUE.
+HFSCREEN = 0.2
+AEXX     = $AEXX
+ALGO     = All
+TIME     = 0.4
+PRECFOCK = Fast
+ISPIN  = 2
+LORBIT = 10
+LWAVE  = .FALSE.
+LCHARG = .TRUE.
+ICORELEVEL = 1
+LVHAR  = .TRUE.
+ICHARG = 1
+NPAR   = 8
+$nelect_line
+INCAR_EOF
+    }
+
+    local charged_dirs=()
+
+    # 从 defect_config.txt 读取各缺陷的电荷态
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        read -r category name operation atom_index replace_elem charge_states <<< "$line"
+
+        local cat_dir
+        [ "$category" = "intrinsic" ] && cat_dir="Intrinsic" || cat_dir="Impurity"
+        local defect_base="$WORKDIR/Defect/$cat_dir/$name"
+
+        # 获取 q0 中性 NELECT
+        local q0_relax="$defect_base/q0/relax"
+        [ -d "$q0_relax" ] || continue
+        local nelect_neutral=$(get_nelect "$q0_relax")
+
+        IFS=',' read -ra charges <<< "$charge_states"
+        for q in "${charges[@]}"; do
+            q=$(echo "$q" | tr -d ' ')
+            local q_num=$(echo "$q" | sed 's/+//')
+            local nelect=$((nelect_neutral - q_num))
+
+            local q_hse="$defect_base/q${q}/statics_hse"
+            local q_relax="$defect_base/q${q}/relax"
+            [ -d "$q_relax" ] || continue
+            is_converged "$q_relax" || continue
+
+            mkdir -p "$q_hse"
+            cp "$q_relax/CONTCAR" "$q_hse/POSCAR"
+            cp "$q_relax/CHGCAR" "$q_hse/CHGCAR"
+            cp "$q_relax/POTCAR" "$q_hse/POTCAR"
+            cat > "$q_hse/KPOINTS" << 'KPT'
+Gamma
+0
+G
+1 1 1
+0 0 0
+KPT
+            write_hse_static_incar "$q_hse" "$nelect"
+            write_submit_gam "$q_hse" "${name}_q${q}_hse"
+            submit_dir "$q_hse" "$name/q${q}/statics_hse"
+
+            charged_dirs+=("$q_hse")
+        done
+    done < "$CONFIG"
+
+    wait_for_jobs "HSE statics (charged)" "${charged_dirs[@]}"
+}
+
+# ============================================================
+# PHASE 5: FNV Corrections + Formation Energy
+# ============================================================
+phase5_formation_energy() {
+    log_msg "===== PHASE 5: FNV Corrections + Formation Energy ====="
+
+    local HSE_GAP=$(cat "$WORKDIR/Bulk/AEXX/hse_band_gap.txt")
+    log_msg "HSE band gap: $HSE_GAP eV"
+
+    # 备份 formation_config.yaml
+    [ -f "$WORKDIR/formation_config.yaml" ] && \
+        cp "$WORKDIR/formation_config.yaml" "$WORKDIR/formation_config.yaml.level1_bak"
+
+    # 写 LEVEL2 config — 使用 statics_hse 路径和 HSE 带隙
+    # 注意: defects 列表和化学势参数需根据具体体系修改
+    cat > "$WORKDIR/formation_config.yaml" << YAML_EOF
+# Formation energy configuration — LEVEL2 (PBE relax + HSE statics)
+level: 2
+bulk_static: Bulk/statics_hse
+epsilon: 10.0
+madelung: 2.8373
+band_gap: $HSE_GAP
+mu_O_ref: -4.9275
+chemical_potential_limits:
+  O-rich: 0.0
+  O-poor: -10.077
+defects:
+  - name: V_O
+    path: Defect/Intrinsic/V_O
+    n_O_removed: 1
+    statics_suffix: statics_hse
+YAML_EOF
+
+    log_msg "Updated formation_config.yaml for LEVEL2"
+
+    # 运行形成能计算
+    # 使用修改版的 formation_energy.py，支持 statics_suffix 参数
+    # 输出到 FormationEnergy_L2/ 目录
+    cd "$WORKDIR"
+    python3 formation_energy.py --config formation_config.yaml --output FormationEnergy_L2/ 2>&1 | tee -a "$LOG"
+
+    log_msg "===== LEVEL2 WORKFLOW COMPLETE ====="
+    log_msg "Results in FormationEnergy_L2/"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+log_msg "===== LEVEL2 AUTO MONITOR STARTED ====="
+log_msg "WORKDIR: $WORKDIR"
+log_msg "Check interval: ${INTERVAL}s"
+
+cd "$WORKDIR"
+
+phase1_ktest
+phase2_aexx
+phase3_hse_preliminary
+phase4_hse_charged
+phase5_formation_energy
+
+log_msg "===== LEVEL2 MONITOR STOPPED: ALL COMPLETE ====="
+```
+
+#### LEVEL2 启动方式
+
+```bash
+# 1. 确保已完成 LEVEL1 的 bulk relax + defect relax（PBE弛豫阶段）
+# 2. 准备 ktest 目录（原胞 + 多个k-mesh PBE static）
+# 3. 启动
+
+nohup bash auto_level2.sh > level2_monitor.out 2>&1 &
+echo $! > level2_monitor.pid
+echo "LEVEL2 monitor started, PID=$(cat level2_monitor.pid)"
+
+# 查看实时进度
+tail -f level2_monitor.out
+
+# 查看详细日志
+cat defect_workflow.log
+
+# 停止
+kill $(cat level2_monitor.pid)
+```
+
+#### LEVEL2 目录结构（新增部分）
+
+```
+ProjectRoot/
+├── Bulk/
+│   ├── ktest/                    # K-mesh 收敛测试（原胞）
+│   │   ├── primitive_POSCAR
+│   │   ├── k1/ ... k4/          # 不同 k-mesh 的 PBE static
+│   │   ├── converged_kmesh.txt   # 收敛的 k-mesh
+│   │   └── converged_dir.txt
+│   ├── AEXX/                     # AEXX 拟合（原胞 HSE）
+│   │   ├── primitive_POSCAR
+│   │   ├── aexx_0.20/ aexx_0.25/ aexx_0.30/
+│   │   ├── aexx_fit.log          # 拟合结果
+│   │   ├── fitted_aexx.txt       # 最优 AEXX 值
+│   │   └── hse_band_gap.txt      # HSE 带隙
+│   ├── relax/                    # PBE bulk relax (已有)
+│   ├── statics/                  # PBE statics (LEVEL1, 保留)
+│   └── statics_hse/              # HSE statics (LEVEL2, 新增)
+├── Defect/
+│   └── Intrinsic/
+│       └── V_O/
+│           ├── q0/
+│           │   ├── relax/        # PBE relax (已有)
+│           │   ├── statics/      # PBE statics (LEVEL1, 保留)
+│           │   └── statics_hse/  # HSE statics (LEVEL2, 新增)
+│           ├── q+1/
+│           │   ├── relax/
+│           │   ├── statics/
+│           │   └── statics_hse/
+│           └── q+2/
+│               ├── relax/
+│               ├── statics/
+│               └── statics_hse/
+├── FormationEnergy/              # LEVEL1 结果
+├── FormationEnergy_L2/           # LEVEL2 结果
+├── formation_config.yaml         # 当前配置（LEVEL2覆盖后的）
+├── formation_config.yaml.level1_bak  # LEVEL1配置备份
+├── auto_monitor.sh               # LEVEL1 自动化
+└── auto_level2.sh                # LEVEL2 自动化
+```
+
+#### formation_energy.py 对 LEVEL2 的支持
+
+`formation_energy.py` 需要支持 `statics_suffix` 参数，以便从 `statics_hse/` 而非 `statics/` 读取结果：
+
+```python
+# 在 find_charge_dirs 之后、读取 OUTCAR 之前，替换目录路径
+statics_dir = os.path.join(q_dir, defect_cfg.get("statics_suffix", "statics"))
+```
+
+`formation_config.yaml` 中每个 defect 项可指定：
+```yaml
+defects:
+  - name: V_O
+    path: Defect/Intrinsic/V_O
+    n_O_removed: 1
+    statics_suffix: statics_hse   # LEVEL2 HSE statics 目录名
 ```
 
 ---
