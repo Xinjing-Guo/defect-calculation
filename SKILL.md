@@ -502,18 +502,27 @@ Step 4: Neutral Defect Relaxation (ISIF=2, no NELECT)
     LEVEL1/2: PBE relax | LEVEL3: HSE relax
     提交所有 q0/relax/ 任务（可并行），等待收敛
     ↓ 【必须等所有 q0/relax 完成】
-Step 5: Charge State Determination
-    分析 q0/relax/EIGENVAL 确定各缺陷的带电态
+Step 5: Preliminary Statics (Bulk + q0 only) + Charge State Determination
+    LEVEL1: PBE statics | LEVEL2/3: HSE statics
+    先仅对 Bulk 和所有 q0 进行 statics 计算
+    → Bulk/statics/ + 所有 Defect/*/q0/statics/
+    ↓ 【必须等 Bulk/statics 和 q0/statics 完成】
+    分析 q0/statics/EIGENVAL 与 Bulk/statics/EIGENVAL 对比确定各缺陷的带电态
+    ⚠ 必须使用 statics/EIGENVAL（而非 relax/EIGENVAL）：
+      LEVEL1: statics 与 relax 均为 PBE，差异不大，但 statics 更准确
+      LEVEL2: statics 为 HSE，带隙和缺陷能级位置与 PBE relax 显著不同
+      LEVEL3: statics 为 HSE，与 HSE relax 一致，但 statics 更严格
     ↓
 Step 6: Charged Defect Relaxation Setup + Submission
     LEVEL1/2: PBE relax | LEVEL3: HSE relax
     用 q0/relax/CONTCAR 作为起始结构
     → 准备所有 q±n/relax/ 的输入文件，提交任务
     ↓ 【必须等所有 charged relax 完成】
-Step 7: Static Calculations Setup + Submission
+Step 7: Charged Defect Static Calculations
     LEVEL1: PBE statics | LEVEL2/3: HSE statics
-    用各 relax/CONTCAR 准备 statics/ 输入文件
-    → Bulk/statics/ + 所有 Defect/*/q*/statics/
+    用各 charged relax/CONTCAR 准备 statics/ 输入文件
+    → 所有 Defect/*/q±n/statics/
+    （Bulk/statics 和 q0/statics 在 Step 5 已完成，无需重复）
     ↓ 【必须等所有 statics 完成】
 Step 8: Finite-Size Corrections
     FNV (Freysoldt) or Kumagai correction for charged defects
@@ -528,8 +537,9 @@ Step 9: Formation Energy & Diagram
 |------|---------|------------|---------|
 | 初始 | `Bulk/relax/` 的全部输入 | 用户提供的原胞 → 构建超胞 | 无 |
 | Bulk收敛后 | 所有 `q0/relax/` 的输入 | `Bulk/relax/CONTCAR`（移除/替换原子） | 无 |
-| q0收敛后 | 所有 `q±n/relax/` 的输入 | **`q0/relax/CONTCAR`**（已弛豫的中性缺陷结构） | EIGENVAL分析确定电荷态 |
-| 所有relax收敛后 | 所有 `statics/` 的输入 | 各 `relax/CONTCAR` | 各 `relax/CHGCAR`（ICHARG=1） |
+| q0 relax收敛后 | `Bulk/statics/` + 所有 `q0/statics/` | `Bulk/relax/CONTCAR`, `q0/relax/CONTCAR` | 各 `relax/CHGCAR`（ICHARG=1） |
+| Bulk+q0 statics收敛后 | 所有 `q±n/relax/` 的输入 | **`q0/relax/CONTCAR`**（已弛豫的中性缺陷结构） | **statics/EIGENVAL** 分析确定电荷态 |
+| charged relax收敛后 | 所有 `q±n/statics/` 的输入 | 各 charged `relax/CONTCAR` | 各 `relax/CHGCAR`（ICHARG=1） |
 
 **关键：带电缺陷的起始结构是中性弛豫后的 CONTCAR，不是从 bulk 重新构建的缺陷结构。**
 这样做的原因是中性缺陷弛豫后原子位置已经松弛到缺陷附近的平衡位置，以此为起点加/减电子再弛豫，收敛更快、结果更可靠。
@@ -732,11 +742,22 @@ NPAR = 8
 
 ---
 
-## Step 5: Charge State Determination (from EIGENVAL Analysis)
+## Step 5: Preliminary Statics + Charge State Determination
+
+**前置条件：** `Bulk/relax/` 和所有 `q0/relax/` 已收敛。
+
+**操作顺序：**
+1. 先对 Bulk 和所有 q0 缺陷运行 statics 计算（LEVEL1: PBE, LEVEL2/3: HSE）
+2. 等待 statics 收敛后，用 **statics/EIGENVAL** 进行电荷态分析
+
+**⚠ 关键：必须使用 statics/EIGENVAL 而非 relax/EIGENVAL：**
+- `relax/EIGENVAL` 来自弛豫过程中的电子结构，精度较低（NSW≠0，离子仍在移动）
+- `statics/EIGENVAL` 来自固定结构的精确单点计算，VBM/CBM/缺陷能级位置更准确
+- **LEVEL2 尤其关键**：relax 用 PBE（带隙偏小），statics 用 HSE（带隙接近实验值），两者的缺陷能级位置可能有本质差异，直接影响电荷态判断
 
 ### Core Method: Compare Defect vs Bulk EIGENVAL
 
-After the neutral defect relaxation (Step 4) and the bulk relaxation/static, compare their EIGENVAL files to:
+在 Bulk/statics/ 和 q0/statics/ 完成后，比较它们的 EIGENVAL 文件：
 1. Identify the **bulk band structure特征** — VBM, CBM, 以及价带/导带的能量分布模式
 2. 在缺陷EIGENVAL中找到**缺陷能级** — 不属于bulk价带或导带的"多出来"的态
 3. 分析缺陷能级的**占据情况**
